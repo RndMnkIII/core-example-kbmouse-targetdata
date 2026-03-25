@@ -1108,6 +1108,43 @@ always @(posedge clk_74a) begin
     end
     
     // handle the reloading of the framebuffer image by requesting a slot read at a certain offset in the slot's file
+    //
+    // Framebuffer layout in SDRAM (data slot 0x20 / 0x22):
+    //   - Resolution  : 320 x 288 pixels  (VID_H_ACTIVE x VID_V_ACTIVE)
+    //   - Pixel format: RGB565, 16 bits per pixel
+    //                     bits [15:11] = R (5 bits)
+    //                     bits [10:5]  = G (6 bits)
+    //                     bits [4:0]   = B (5 bits)
+    //   - Storage     : linear, row-major order; 2 pixels packed into each 32-bit SDRAM word
+    //                   word address = (row * VID_H_ACTIVE/2) + (col/2)
+    //                   byte mask    : bits[1:0] selects the high (odd col) or low (even col) pixel
+    //   - Total size  : 320 * 288 * 2 = 184,320 bytes (0x2D000 bytes)
+    //   - SDRAM byte address range:
+    //                   Start : 0x00000000  (bridge address 0x00000000)
+    //                   End   : 0x0002CFFF  (= 184320 - 1)
+    //
+    // Saved Image slot (data.json id 0x22, filename "saved.bin"):
+    //   - The entire framebuffer contents are written verbatim from SDRAM to saved.bin.
+    //   - saved.bin is therefore 184,320 bytes of raw RGB565 data, row 0 first, no header.
+    //   - "parameters": 3  in data.json allows APF to communicate up to 3 extra 32-bit
+    //     parameter values for this slot (slot_offset, bridge_address, length) via the
+    //     host command 0x008A (Data Slot Update), enabling variable-size write support.
+    //
+    // Dump trigger (save, data slot 0x22 WRITE):
+    //   - Initiated when the user presses the Select button (cont1_key[14]).
+    //   - APF target command 0x0184 (Data Slot Write) is issued with:
+    //       target_dataslot_id         = 0x0022
+    //       target_dataslot_slotoffset = 0x00000000  (start of saved.bin)
+    //       target_dataslot_bridgeaddr = 0x00000000  (SDRAM start)
+    //       target_dataslot_length     = 184320      (0x2D000 bytes)
+    //   - APF reads 184,320 bytes from SDRAM (bridge 0x00000000–0x0002CFFF) and writes
+    //     them to the SD-card file "saved.bin", creating or overwriting it as needed.
+    //
+    // Load trigger (restore, data slot 0x22 READ):
+    //   - Initiated when the user presses the Start button (cont1_key[15]).
+    //   - APF target command 0x0180 (Data Slot Read) is issued with the same parameters.
+    //   - APF reads saved.bin from SD-card and DMA-writes the 184,320 bytes back into
+    //     SDRAM starting at bridge address 0x00000000.
     case(reload_state)
     0: begin
     
@@ -1129,7 +1166,9 @@ always @(posedge clk_74a) begin
         if(cont1_key[6]) target_dataslot_slotoffset <= 184320*2;
         if(cont1_key[7]) target_dataslot_slotoffset <= 184320*3;
                 
-        // select - save to saved slot
+        // select - save framebuffer to saved slot (data slot 0x22, file saved.bin)
+        // triggers APF target command 0x0184: reads 184,320 bytes from SDRAM
+        // bridge address range 0x00000000..0x0002CFFF and writes to saved.bin
         if(cont1_key[14]) begin
             ram_reloading <= 1;
         
@@ -1142,7 +1181,9 @@ always @(posedge clk_74a) begin
             
             reload_state <= 1;
         end
-        // start - load from saved slot
+        // start - load framebuffer from saved slot (data slot 0x22, file saved.bin)
+        // triggers APF target command 0x0180: APF writes 184,320 bytes from saved.bin
+        // into SDRAM bridge address range 0x00000000..0x0002CFFF
         if(cont1_key[15]) begin
             ram_reloading <= 1;
         
