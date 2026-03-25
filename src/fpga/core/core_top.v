@@ -1108,6 +1108,74 @@ always @(posedge clk_74a) begin
     end
     
     // handle the reloading of the framebuffer image by requesting a slot read at a certain offset in the slot's file
+    //
+    // ─── Framebuffer memory layout (SDRAM) ───────────────────────────────────────
+    //   Resolution  : 320 x 288 pixels  (VID_H_ACTIVE x VID_V_ACTIVE)
+    //   Pixel format: RGB565, 16 bits per pixel
+    //                   bits [15:11] = R (5 bits)
+    //                   bits [10:5]  = G (6 bits)
+    //                   bits [4:0]   = B (5 bits)
+    //   Storage     : linear, row-major order; 2 pixels packed per 32-bit SDRAM word
+    //                   word address = (row * VID_H_ACTIVE/2) + (col/2)
+    //                   wrmask[0]=1 selects lower halfword [15:0]  → even column pixel
+    //                   wrmask[1]=1 selects upper halfword [31:16] → odd  column pixel
+    //   Total size  : 320 * 288 * 2 = 184,320 bytes (0x2D000)
+    //   Bridge byte address range:
+    //                   Start : 0x00000000
+    //                   End   : 0x0002CFFF  (= 184,320 - 1)
+    //
+    // ─── data.json slot 0x20 — "Image Bank" (ex_image_all.bin) ──────────────────
+    //   parameters : 2  →  bits [1:0] = 0b10
+    //     bit 0 (cleared) : NOT user-reloadable — slot does not appear in Interact menu
+    //     bit 1 (SET)     : Core-specific file — file is distributed with this core and
+    //                       stored in the core's own Assets folder, not shared platform-wide
+    //   deferload  : true → APF does NOT auto-load the file on boot.  It still writes
+    //                       the slot's ID (0x20) and filesize into the Dataslot ID/Size
+    //                       table at bridge 0x2000–0x20FF so the core can query the size.
+    //                       The core loads images explicitly via Target command 0x0180.
+    //   address    : 0x00000000 → intended load address in SDRAM (informational when
+    //                       deferload is true; the core controls the actual DMA address).
+    //
+    // ─── data.json slot 0x22 — "Saved Image" (saved.bin) ───────────────────────
+    //   The entire SDRAM framebuffer is saved/restored verbatim as 184,320 bytes of
+    //   raw RGB565 data, row 0 first, with no header.
+    //
+    //   parameters : 3  →  bits [1:0] = 0b11   ← THIS IS A BITMAP, NOT A COUNT
+    //     bit 0 (SET) : User-reloadable — saved.bin appears in Pocket's Core UI
+    //                   Interact menu at runtime.  When the user picks a new file,
+    //                   APF sends host command 0x008A (Data Slot Update) and refreshes
+    //                   the Dataslot ID/Size table only (does NOT send 0x0082/0x008F
+    //                   as it would for a non-deferload slot).
+    //     bit 1 (SET) : Core-specific file — saved.bin lives in the core's own
+    //                   Assets folder, not shared across other cores for this platform.
+    //   deferload  : true → APF does NOT load saved.bin automatically on boot.
+    //                       It still writes the slot's ID (0x22) and the existing
+    //                       filesize (0 if no file yet) into bridge 0x2000–0x20FF.
+    //   required   : false → if saved.bin does not exist the slot is silently skipped.
+    //
+    // ─── Dataslot ID/Size table (bridge 0x2000–0x20FF) ──────────────────────────
+    //   32-entry table; each entry is 2 × 32-bit words:
+    //     Word 0 [15:0]  : slot ID (e.g. 0x0022)
+    //     Word 1 [31:0]  : file size in bytes (written by APF on load; may be
+    //                      updated by the core for nonvolatile slots)
+    //   Even with deferload=true APF populates this table so the core knows the
+    //   on-disk file size without issuing any extra Target command.
+    //
+    // ─── Save trigger — Select button (cont1_key[14]) ───────────────────────────
+    //   Issues Target command 0x0184 (Data Slot Write) with 4 parameters:
+    //     param[0]  target_20 [15:0]  = 0x0022          (slot id)
+    //     param[1]  target_24 [31:0]  = 0x00000000      (slot offset in saved.bin)
+    //     param[2]  target_28 [31:0]  = 0x00000000      (BRIDGE / SDRAM start address)
+    //     param[3]  target_2C [31:0]  = 184320 (0x2D000)(byte count)
+    //   APF reads 184,320 bytes from bridge 0x00000000–0x0002CFFF and writes them to
+    //   saved.bin on the SD card, creating or overwriting the file as needed.
+    //   Result code (captured in target_dataslot_err): 0=ok, 1=slot undefined, 2=error.
+    //
+    // ─── Load trigger — Start button (cont1_key[15]) ────────────────────────────
+    //   Issues Target command 0x0180 (Data Slot Read) with the same 4 parameters.
+    //   APF reads saved.bin from the SD card and DMA-writes the 184,320 bytes into
+    //   SDRAM starting at bridge address 0x00000000.
+    //   Result code (captured in target_dataslot_err): 0=ok, 1=slot undefined, 2=error.
     case(reload_state)
     0: begin
     
@@ -1129,7 +1197,9 @@ always @(posedge clk_74a) begin
         if(cont1_key[6]) target_dataslot_slotoffset <= 184320*2;
         if(cont1_key[7]) target_dataslot_slotoffset <= 184320*3;
                 
-        // select - save to saved slot
+        // Select — save framebuffer to saved slot (data slot 0x22, file saved.bin).
+        // Target command 0x0184 (Data Slot Write): APF reads 184,320 bytes from SDRAM
+        // bridge 0x00000000..0x0002CFFF and writes them to saved.bin on SD card.
         if(cont1_key[14]) begin
             ram_reloading <= 1;
         
@@ -1142,7 +1212,9 @@ always @(posedge clk_74a) begin
             
             reload_state <= 1;
         end
-        // start - load from saved slot
+        // Start — load framebuffer from saved slot (data slot 0x22, file saved.bin).
+        // Target command 0x0180 (Data Slot Read): APF reads saved.bin from SD card
+        // and DMA-writes 184,320 bytes into SDRAM bridge 0x00000000..0x0002CFFF.
         if(cont1_key[15]) begin
             ram_reloading <= 1;
         
